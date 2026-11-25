@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>λ Global Chat</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #ff9900; --mine: #1f3a5f; --error: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  header {
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 10px 16px; padding-top: max(10px, env(safe-area-inset-top));
+  }
+  h1 { margin: 0 0 6px; font-size: 1.05rem; }
+  h1 span { color: var(--accent); }
+  #status {
+    display: flex; flex-wrap: wrap; gap: 6px 14px;
+    font: 0.8rem/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+  }
+  #status b { color: var(--text); font-weight: 600; }
+  #status .new { color: var(--accent); }
+  #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 4px; }
+  #dot.ok { background: #3fb950; }
+  #dot.err { background: var(--error); }
+  #feed {
+    flex: 1; overflow-y: auto; padding: 12px 16px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .msg {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 10px; max-width: 85%; align-self: flex-start; overflow-wrap: anywhere;
+  }
+  .msg.mine { align-self: flex-end; background: var(--mine); border-color: #2f5d8f; }
+  .meta { font-size: 0.75rem; color: var(--muted); margin-bottom: 2px; }
+  .meta .who { color: var(--accent); font-weight: 600; margin-right: 6px; }
+  .empty { color: var(--muted); text-align: center; margin: auto; }
+  form {
+    display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  input, button {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; min-width: 0;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #user { flex: 1 1 100%; }
+  #text { flex: 1 1 auto; }
+  button { background: var(--accent); color: #111; border: none; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #error { flex: 1 1 100%; color: var(--error); font-size: 0.85rem; min-height: 0; }
+  #error:empty { display: none; }
+  @media (min-width: 640px) {
+    #user { flex: 0 0 160px; }
+    header, #feed, form { padding-left: max(16px, calc(50% - 360px)); padding-right: max(16px, calc(50% - 360px)); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>λ</span> Global Chat</h1>
+  <div id="status">
+    <span><span id="dot"></span><span id="conn">connecting…</span></span>
+    <span>instance <b id="instance">—</b></span>
+    <span>invocation <b id="count">—</b></span>
+    <span>latency <b id="latency">—</b></span>
+    <span>instances seen <b id="seen">0</b></span>
+  </div>
+</header>
+
+<main id="feed" aria-live="polite"><p class="empty">No messages yet. Say hi!</p></main>
+
+<form id="form" autocomplete="off">
+  <input id="user" placeholder="Your name" maxlength="20" required>
+  <input id="text" placeholder="Message" maxlength="280" required>
+  <button id="send" type="submit">Send</button>
+  <div id="error" role="alert"></div>
+</form>
+
+<script>
+// =====================================================================
+// PASTE YOUR LAMBDA FUNCTION URL HERE (printed by ./deploy.sh)
+const API_URL = "https://uxvygcqsb63q72po35dghz3jxe0qfyvw.lambda-url.eu-north-1.on.aws/";
+// =====================================================================
+
+const POLL_MS = 2500;
+const $ = (id) => document.getElementById(id);
+const feed = $("feed"), userInput = $("user"), textInput = $("text");
+const seenInstances = new Set();
+let lastRenderedKey = "";
+let pollTimer = null;
+let requestSeq = 0, appliedSeq = 0;
+
+try { userInput.value = localStorage.getItem("chat-user") || ""; } catch {}
+userInput.addEventListener("input", () => {
+  try { localStorage.setItem("chat-user", userInput.value.trim()); } catch {}
+});
+
+async function callLambda(method, body) {
+  const started = performance.now();
+  let url = API_URL;
+  if (method === "GET" && userInput.value.trim()) {
+    url += "?user=" + encodeURIComponent(userInput.value.trim());
+  }
+  const res = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    cache: "no-store",
+  });
+  let data = {};
+  try { data = await res.json(); } catch {}
+  showMeta(data.meta, Math.round(performance.now() - started));
+  if (res.status === 429) throw new Error("paused (free-tier kill switch or too many requests)");
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function showMeta(meta, ms) {
+  $("latency").textContent = ms + " ms";
+  if (!meta) return;
+  const instance = $("instance");
+  const isNew = !seenInstances.has(meta.instance_id);
+  seenInstances.add(meta.instance_id);
+  instance.textContent = meta.instance_id;
+  instance.classList.toggle("new", isNew);  // orange = first time we see this environment
+  $("count").textContent = "#" + meta.invocation_count;
+  $("seen").textContent = seenInstances.size;
+}
+
+function setConnection(ok, label) {
+  $("dot").className = ok ? "ok" : "err";
+  $("conn").textContent = label;
+}
+
+function render(messages) {
+  const key = messages.length ? messages[messages.length - 1].id + ":" + messages.length : "empty";
+  if (key === lastRenderedKey) return;
+  lastRenderedKey = key;
+
+  const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  const me = userInput.value.trim();
+  feed.replaceChildren();
+
+  if (!messages.length) {
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = "No messages yet. Say hi!";
+    feed.append(p);
+    return;
+  }
+
+  // All user-supplied strings go through textContent, never innerHTML.
+  for (const m of messages) {
+    const div = document.createElement("div");
+    div.className = "msg" + (m.user === me ? " mine" : "");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = m.user;
+    const when = document.createElement("span");
+    when.textContent = new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      + (m.instance_id ? " · λ " + m.instance_id : "");
+    meta.append(who, when);
+    const text = document.createElement("div");
+    text.textContent = m.text;
+    div.append(meta, text);
+    feed.append(div);
+  }
+  if (nearBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+async function refresh() {
+  const mySeq = ++requestSeq;  // a poll and a post-send refresh can overlap; only the newest wins
+  try {
+    const data = await callLambda("GET");
+    if (mySeq < appliedSeq) return;
+    appliedSeq = mySeq;
+    render(data.messages || []);
+    setConnection(true, "live");
+  } catch (err) {
+    if (mySeq >= appliedSeq) setConnection(false, "offline: " + err.message);
+  }
+}
+
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) await refresh();
+    schedulePoll();
+  }, POLL_MS);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { refresh(); schedulePoll(); }
+});
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const user = userInput.value.trim();
+  const text = textInput.value.trim();
+  $("error").textContent = "";
+  if (!user || !text) { $("error").textContent = "Name and message are required."; return; }
+
+  $("send").disabled = true;
+  try {
+    await callLambda("POST", { user, text });
+    textInput.value = "";
+    lastRenderedKey = "";
+    feed.scrollTop = feed.scrollHeight;
+    await refresh();
+    feed.scrollTop = feed.scrollHeight;
+  } catch (err) {
+    $("error").textContent = err.message;
+  } finally {
+    $("send").disabled = false;
+    textInput.focus();
+  }
+});
+
+refresh();
+schedulePoll();
+</script>
+</body>
+</html>
