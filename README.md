@@ -74,9 +74,9 @@ To deploy without the CLI, drag the `web/` folder into **Workers & Pages → Cre
 Watch every invocation live on the projector:
 
 ```bash
-aws logs start-live-tail \
-  --log-group-identifiers "arn:aws:logs:$(aws configure get region):$(aws sts get-caller-identity --query Account --output text):log-group:/aws/lambda/lambda-chat-demo" \
-  --log-event-filter-pattern '"[LAMBDA]"'
+./deploy.sh logs           # just stream the logs (Ctrl+C to stop)
+./deploy.sh --log          # deploy, then stream the logs
+./deploy.sh revive --log   # --log works after pause/revive/clear too
 ```
 
 You can also open **CloudWatch → Live Tail**, pick `/aws/lambda/lambda-chat-demo` and filter on `[LAMBDA]`. You'll see:
@@ -96,6 +96,23 @@ Things worth showing:
 - **Which environment stored a message:** each message shows the `λ <instance>` that handled its `POST`.
 
 Guardrails: empty messages, names over 20 characters, messages over 280 characters, bodies over 4 KB and malformed JSON get a `400` response. The server collapses newlines and strips invisible characters. The page renders everything with `textContent`.
+
+## Pause, restart and clear messages
+
+```bash
+./deploy.sh pause    # chat off: the Function URL answers 429, the page shows "paused"
+./deploy.sh revive   # chat back on (also undoes a tripped kill switch)
+./deploy.sh clear    # delete every message
+```
+
+Add `--log` to any of these to start streaming the logs once it finishes.
+
+Messages also delete themselves 24 hours after they're sent. To remove a single message, take its `id` from the `GET` response and run:
+
+```bash
+aws dynamodb delete-item --table-name lambda-chat-demo-messages \
+  --key '{"room":{"S":"global"},"ts":{"N":"<id>"}}'
+```
 
 ## Cost and the kill switch
 

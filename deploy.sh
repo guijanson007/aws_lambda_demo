@@ -2,10 +2,24 @@
 # Idempotent deploy of the Lambda chat demo using only the AWS CLI.
 # Everything stays inside the AWS *always free* tier (see README "Cost").
 #   ./deploy.sh           create or update everything, print the Function URL
-#   ./deploy.sh revive    turn the chat back on after the kill switch tripped
+#   ./deploy.sh pause     turn the chat off (the Function URL answers 429)
+#   ./deploy.sh revive    turn the chat back on (after pause, or after the kill switch tripped)
+#   ./deploy.sh clear     delete every chat message
+#   ./deploy.sh logs      only stream the live logs (same as --log without deploying)
 #   ./deploy.sh destroy   delete every AWS resource this script creates
+# Add --log to any command except destroy to stream the chat function's logs
+# (CloudWatch Logs Live Tail) when it finishes, e.g. ./deploy.sh --log
 set -euo pipefail
 cd "$(dirname "$0")"
+
+COMMAND="" LOG=false
+for arg in "$@"; do
+  case "$arg" in
+    --log) LOG=true ;;
+    -*) echo "Unknown option: $arg" >&2; exit 1 ;;
+    *) COMMAND="$arg" ;;
+  esac
+done
 
 APP="lambda-chat-demo"
 TABLE="$APP-messages"
@@ -25,6 +39,17 @@ TABLE_ARN="arn:aws:dynamodb:$AWS_REGION:$ACCOUNT:table/$TABLE"
 FUNCTION_ARN="arn:aws:lambda:$AWS_REGION:$ACCOUNT:function:$FUNCTION"
 log_arn() { echo "arn:aws:logs:$AWS_REGION:$ACCOUNT:log-group:/aws/lambda/$1"; }
 
+# Stream the "[LAMBDA]" lines live until Ctrl+C (with --log), then exit.
+finish() {
+  if $LOG; then
+    echo
+    echo "Streaming live logs from /aws/lambda/$FUNCTION (Ctrl+C to stop)..."
+    exec aws logs start-live-tail --log-group-identifiers "$(log_arn "$FUNCTION")" \
+      --log-event-filter-pattern '"[LAMBDA]"'
+  fi
+  exit 0
+}
+
 destroy() {
   echo "Deleting $APP resources in $AWS_REGION..."
   aws events remove-targets --rule "$KILL_RULE" --ids 1 >/dev/null 2>&1 || true
@@ -39,12 +64,32 @@ destroy() {
   echo "Done."
 }
 
-case "${1:-}" in
+case "$COMMAND" in
   destroy) destroy; exit 0 ;;
+  logs) LOG=true; finish ;;
+  pause)
+    aws lambda put-function-concurrency --function-name "$FUNCTION" --reserved-concurrent-executions 0 >/dev/null
+    echo "Chat paused: the Function URL now answers 429. Turn it back on with ./deploy.sh revive"
+    finish ;;
   revive)
     aws lambda delete-function-concurrency --function-name "$FUNCTION"
     echo "Chat function re-enabled. The kill switch trips again if this month's invocations pass $KILL_THRESHOLD."
-    exit 0 ;;
+    finish ;;
+  clear)
+    # Uses your own CLI credentials: the chat function itself is not allowed to delete anything.
+    COUNT=0
+    for ts in $(aws dynamodb query --table-name "$TABLE" \
+        --key-condition-expression "#r = :room" --expression-attribute-names '{"#r":"room"}' \
+        --expression-attribute-values '{":room":{"S":"global"}}' \
+        --projection-expression ts --query 'Items[].ts.N' --output text); do
+      aws dynamodb delete-item --table-name "$TABLE" \
+        --key "{\"room\":{\"S\":\"global\"},\"ts\":{\"N\":\"$ts\"}}"
+      COUNT=$((COUNT + 1))
+    done
+    echo "Deleted $COUNT message(s)."
+    finish ;;
+  "") ;;
+  *) echo "Unknown command: $COMMAND (use logs, pause, revive, clear or destroy)" >&2; exit 1 ;;
 esac
 
 # Log group with 1-day retention, created here so roles don't need logs:CreateLogGroup.
@@ -187,4 +232,5 @@ URL="$(aws lambda get-function-url-config --function-name "$FUNCTION" --query Fu
 echo
 echo "Function URL: $URL"
 echo "Paste it into API_URL at the top of the <script> in web/index.html."
-echo "Live logs:    aws logs start-live-tail --log-group-identifiers $(log_arn "$FUNCTION") --log-event-filter-pattern '\"[LAMBDA]\"'"
+$LOG || echo "Live logs:    ./deploy.sh logs"
+finish
